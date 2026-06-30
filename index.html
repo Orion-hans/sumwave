@@ -709,9 +709,11 @@ const AES_VOICE = {
 };
 
 // 상대 구성음(0~) → 음역·보이싱 적용한 MIDI 노트 배열
-function applyVoicing(relSemis, rangeKey, voicingKey){
+function applyVoicing(relSemis, rangeKey, voicingKey, rootSemi){
   const base = RANGES[rangeKey] ? RANGES[rangeKey].base : 60;
-  let notes = relSemis.slice();
+  // 근음: 명시되면 사용, 아니면 입력 첫 음
+  const root = (typeof rootSemi==='number') ? ((rootSemi%12)+12)%12 : (((relSemis[0]%12)+12)%12);
+  let notes = relSemis.slice().sort((a,b)=>a-b);
   const n = notes.length;
   if(voicingKey==='inv1' && n>=3){ notes = notes.slice(1).concat([notes[0]+12]); }
   else if(voicingKey==='inv2' && n>=3){ notes = notes.slice(2).concat([notes[0]+12, notes[1]+12]); }
@@ -719,9 +721,9 @@ function applyVoicing(relSemis, rangeKey, voicingKey){
     notes = [notes[0], notes[2], notes[1]+12].concat(n>3?[notes[3]]:[]);
   }
   else if(voicingKey==='drop2' && n>=4){
-    let s=notes.slice().sort((a,b)=>a-b); s[s.length-2]-=12; notes=s;
+    let s=notes.slice(); s[s.length-2]-=12; notes=s;
   }
-  else if(voicingKey==='power5'){ notes=[0,7,12]; }
+  else if(voicingKey==='power5'){ notes=[root, root+7, root+12]; }  // 근음 기준 1·5·8도
   return notes.map(x=>base+x);
 }
 // 흙탕물 경고: 저음역(MIDI 40 이하)에서 좁은 간격(4반음 이하)
@@ -901,7 +903,7 @@ function playBGM(btn, chordStr){
       if(!relSemis) return;
       // 음역·보이싱 적용 → MIDI 노트
       const rk=effectiveRange(), vk=effectiveVoicing();
-      const voicedNotes = applyVoicing(relSemis.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk);
+      const voicedNotes = applyVoicing(relSemis.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk, relSemis[0]);
       const t0 = startT + i*chordDur;
       // 패드(화음): 호흡 엔벨로프로 부풂-잦아듦, 코드 시작=들숨
       voicedNotes.forEach(midiNote=>{
@@ -1207,7 +1209,7 @@ function updateVoiceHint(){
     const chs=(currentProgForVoice()||[]);
     for(const ch of chs){
       const rel=chordToSemis(ch); if(!rel) continue;
-      const mn=applyVoicing(rel.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk);
+      const mn=applyVoicing(rel.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk, rel[0]);
       if(checkMud(mn)){ mud=true; break; }
     }
   }catch(e){}
@@ -1521,7 +1523,7 @@ function chordToMidiNotes(chord){
   const rel = chordToSemis(chord); if(!rel) return [];
   // 음역·보이싱 적용 (BGM과 동일 로직)
   const rk=effectiveRange(), vk=effectiveVoicing();
-  return applyVoicing(rel.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk);
+  return applyVoicing(rel.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk, rel[0]);
 }
 function buildMidi(){
   const PPQ = 480; // ticks per quarter
