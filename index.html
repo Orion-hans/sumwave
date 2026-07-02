@@ -705,6 +705,12 @@ function chordToSemis(chord){
   else intervals=[0,4,7];
   return intervals.map(i=>root+i);
 }
+// 슬래시 코드의 베이스음 (G/B → B). 슬래시 없으면 근음. "C6/9"의 /9는 베이스 아님
+function chordBassSemi(chord){
+  const sm = chord.match(/\/([A-G])(#|\u266d|b)?$/);
+  if(sm){ let b=NOTE_SEMI[sm[1]]; if(sm[2]==="#") b+=1; else if(sm[2]) b-=1; return ((b%12)+12)%12; }
+  const r = chordToSemis(chord); return r ? ((r[0]%12)+12)%12 : 0;
+}
 
 // ===== 음역 & 보이싱 =====
 const RANGES = {
@@ -754,6 +760,41 @@ function applyVoicing(relSemis, rangeKey, voicingKey, rootSemi){
   else if(voicingKey==='power5'){ notes=[root, root+7, root+12]; }  // 근음 기준 1·5·8도
   return notes.map(x=>base+x);
 }
+// ===== 진행 단위 보이싱: top voice가 라인을 그리도록 (voice leading) =====
+// power5는 순수 여백 유지(라인 제외). 나머지는 색채음(9·3·7도) top이 최소 이동으로 이어짐
+function pickTopLine(rel, base, lastTop){
+  const rootPc=((rel[0]%12)+12)%12;
+  const pcs=[(rootPc+2)%12];                       // 9th 색채 우선
+  if(rel.length>1) pcs.push(((rel[1]%12)+12)%12);  // 3도(또는 sus음)
+  if(rel.length>3) pcs.push(((rel[3]%12)+12)%12);  // 7th/6th
+  const lo=base+14, hi=base+24;                    // 보이싱 위쪽 창(한정된 음역 = 라인)
+  const ref=(lastTop==null)?(base+19):lastTop;
+  const cands=[];
+  pcs.forEach((pc,rank)=>{
+    for(let oct=base; oct<=base+36; oct+=12){
+      const mm=oct+pc; if(mm>=lo && mm<=hi) cands.push({m:mm, rank});
+    }
+  });
+  if(!cands.length) return ref;
+  cands.sort((a,b)=>(Math.abs(a.m-ref)+a.rank*0.4)-(Math.abs(b.m-ref)+b.rank*0.4));
+  return cands[0].m;
+}
+function voiceProgressionNotes(chordNames, rk, vk){
+  const base = RANGES[rk] ? RANGES[rk].base : 60;
+  let lastTop = null;
+  return chordNames.map(ch=>{
+    const rel = chordToSemis(ch);
+    if(!rel) return null;
+    let notes = applyVoicing(rel.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk, rel[0]);
+    if(vk!=='power5'){
+      const top = pickTopLine(rel, base, lastTop);
+      lastTop = top;
+      notes = notes.filter(n=>n<top);  // top이 항상 제일 윗음 = 선명한 라인
+      if(notes.indexOf(top)<0) notes.push(top);
+    }
+    return notes;
+  });
+}
 // 흙탕물 경고: 저음역(MIDI 40 이하)에서 좁은 간격(4반음 이하)
 function checkMud(midiNotes){
   const s=midiNotes.slice().sort((a,b)=>a-b);
@@ -773,14 +814,16 @@ function playChordProgression(chordStr){
   if(ctx.state==='suspended') ctx.resume();
   stopAllAudio();
   // 진행 분리: "→" 또는 "|" 기준. 슬래시코드는 앞부분만
-  const chords = chordStr.split(/→|\|/).map(s=>s.trim().split("/")[0].trim()).filter(Boolean);
+  const chords = chordStr.split(/→|\|/).map(s=>s.trim()).filter(Boolean); // 슬래시 코드 보존
   const dur = 1.5;
   let t = ctx.currentTime + 0.05;
-  chords.forEach(ch=>{
-    const semis = chordToSemis(ch);
+  // 진행 단위 보이싱: top voice 라인이 미리듣기에서도 들리게
+  const voicedAll = voiceProgressionNotes(chords, effectiveRange(), effectiveVoicing());
+  chords.forEach((ch, ci)=>{
+    const semis = voicedAll[ci];
     if(!semis) return;
-    semis.forEach(s=>{
-      const freq = 220 * Math.pow(2, s/12); // A3 기준 근방
+    semis.forEach(midiNote=>{
+      const freq = 440 * Math.pow(2, (midiNote-69)/12);
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'triangle';
@@ -915,7 +958,7 @@ function playBGM(btn, chordStr){
   else if(['sleep','meditation'].includes(state.purpose)) bgmExtras='singingbowl';
   else if(['spa','calm'].includes(state.purpose)) bgmExtras='tingsha';
 
-  const chords = chordStr.split(/→|\|/).map(s=>s.trim().split("/")[0].trim()).filter(Boolean);
+  const chords = chordStr.split(/→|\|/).map(s=>s.trim()).filter(Boolean); // 슬래시 코드 보존
   // 코드 길이 = 호흡주기 × 배수, 코드 안에서 호흡이 mult번 일어남
   const cl = chordLength();
   const chordDur = cl.sec;        // 코드 1개 길이(초)
@@ -926,12 +969,12 @@ function playBGM(btn, chordStr){
   const out = ambInput();
   function scheduleCycle(startT){
     if(!bgmActive) return;
+    // 진행 단위 보이싱: top voice 라인 (voice leading)
+    const rk=effectiveRange(), vk=effectiveVoicing();
+    const voicedAll = voiceProgressionNotes(chords, rk, vk);
     chords.forEach((ch, i)=>{
-      const relSemis = chordToSemis(ch);
-      if(!relSemis) return;
-      // 음역·보이싱 적용 → MIDI 노트
-      const rk=effectiveRange(), vk=effectiveVoicing();
-      const voicedNotes = applyVoicing(relSemis.map(x=>((x%12)+12)%12).sort((a,b)=>a-b), rk, vk, relSemis[0]);
+      const voicedNotes = voicedAll[i];
+      if(!voicedNotes) return;
       const t0 = startT + i*chordDur;
       // 패드(화음): 호흡 엔벨로프로 부풂-잦아듦, 코드 시작=들숨
       voicedNotes.forEach(midiNote=>{
@@ -957,9 +1000,12 @@ function playBGM(btn, chordStr){
           bgmNodes.push({osc,gain:master});
         });
       });
-      // 베이스 (보이싱 최저음의 한 옥타브 아래)
+      // 베이스: 슬래시 베이스(전위) 반영, 보이싱 아래 옥타브에 배치
       const lowNote = Math.min(...voicedNotes);
-      const bfreq=440*Math.pow(2,((lowNote-12)-69)/12);
+      const bassPc = chordBassSemi(ch);
+      let bassMidi = bassPc + 12*Math.floor((lowNote-12)/12);
+      if(bassMidi > lowNote-3) bassMidi -= 12;
+      const bfreq=440*Math.pow(2,(bassMidi-69)/12);
       const bmaster=ctx.createGain();
       bmaster.gain.setValueAtTime(0,t0);
       bmaster.gain.linearRampToValueAtTime(0.09,t0+br.in);
@@ -1042,20 +1088,35 @@ function currentPool(){
   return PURPOSE_POOL[state.purpose] || "bright";
 }
 
+// 앰비언트 화성 문법: ① 4코드(방향 있는 순환) ② 같은 근음 연속 회피
+// ③ 강한 V→I 종지 회피(명상은 해결하지 않고 떠 있어야) ④ 근음 2·3도 진행 선호 ⑤ 열린 화음으로 종료
+function isOpenChord(ch){ return /sus|add9|maj7|maj9|m9|m11|6\/9|#11/.test(ch); }
+function rootOf(ch){ const r=chordToSemis(ch); return r?((r[0]%12)+12)%12:0; }
+function isPlainMajor(ch){ const q=ch.replace(/^[A-G](#|b|\u266d)?/,''); return q===''||q.indexOf('/')===0; }
 function randomProgression(poolKey, len){
   const pool = CHORD_POOLS[poolKey] || CHORD_POOLS.bright;
-  len = len || (2 + Math.floor(Math.random()*3)); // 2~4코드
+  len = len || 4; // 4코드 = 도입-전개-전개-열린종료 (2코드 진자운동 방지)
   const start = pool.starts[Math.floor(Math.random()*pool.starts.length)];
   const seq = [start];
-  let avail = pool.chords.filter(x=>x!==start);
   for(let i=1;i<len;i++){
-    if(avail.length===0) avail = pool.chords.slice();
-    const idx = Math.floor(Math.random()*avail.length);
-    const pick = avail[idx];
-    // 직전과 같은 코드 회피
-    if(pick===seq[seq.length-1]){ i--; avail.splice(idx,1); continue; }
+    const prev = seq[seq.length-1], prevRoot = rootOf(prev);
+    // 후보 채점
+    const scored = pool.chords.filter(x=>x!==prev && seq.indexOf(x)<0).map(ch=>{
+      const r = rootOf(ch);
+      const iv = Math.min((r-prevRoot+12)%12, (prevRoot-r+12)%12); // 근음 간격(0~6)
+      let w = [0.0, 0.9, 1.0, 1.0, 0.9, 0.7, 0.35][iv]; // 같은근음0, 2·3도 선호
+      // 강한 종지 회피: 근음이 완전5도 하행(V→I)하며 도착이 단순 장화음이면 감점
+      if(((prevRoot - r + 12) % 12) === 7 && isPlainMajor(ch)) w *= 0.15;
+      // 마지막 코드는 열린 화음 선호
+      if(i===len-1) w *= isOpenChord(ch) ? 1.6 : 0.35;
+      return {ch, w};
+    });
+    let total = scored.reduce((s,x)=>s+x.w, 0);
+    if(total<=0){ seq.push(pool.chords[Math.floor(Math.random()*pool.chords.length)]); continue; }
+    let roll = Math.random()*total;
+    let pick = scored[scored.length-1].ch;
+    for(const s of scored){ roll -= s.w; if(roll<=0){ pick=s.ch; break; } }
     seq.push(pick);
-    avail = pool.chords.filter(x=>x!==pick);
   }
   return seq.join(" → ");
 }
@@ -1113,19 +1174,25 @@ function playMelodySemis(arr, baseFreq){
   if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
   const ctx=audioCtx; if(ctx.state==='suspended') ctx.resume();
   stopAllAudio();
-  const dur=0.9; let t=ctx.currentTime+0.05;
-  arr.forEach(s=>{
+  // 리듬 그루브: 길-짧-중 패턴 + 3음마다 숨(쉼표). 시드=선율 자체 (재현)
+  let ms=(function(a){let h=7;for(let i=0;i<a.length;i++)h=(h*31+a[i]+40)%2147483647;return h||7;})(arr);
+  const mr=()=>{ ms=(ms*48271)%2147483647; return ms/2147483647; };
+  const durPat=[1.25,0.6,0.9];
+  let t=ctx.currentTime+0.05; const t0=t;
+  arr.forEach((s,i)=>{
+    const dur=durPat[i%3]*(0.92+mr()*0.16);
     const freq=(baseFreq||261.63)*Math.pow(2,s/12);
     const osc=ctx.createOscillator(); const g=ctx.createGain();
     osc.type='triangle'; osc.frequency.value=freq;
-    g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(0.16,t+0.06);
+    const vol=(i%3===0)?0.17:0.12;             // 프레이즈 첫 음 또렷
+    g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+0.05);
     g.gain.linearRampToValueAtTime(0,t+dur);
     osc.connect(g); g.connect(ctx.destination);
     osc.start(t); osc.stop(t+dur);
     activeNodes.push({osc,gain:g});
-    t+=dur;
+    t+=dur + (i%3===2 ? 0.55 : 0.06);          // 3음마다 숨 (쉼표)
   });
-  return arr.length*dur;
+  return t-t0;
 }
 
 let randomMelodies = [];
@@ -1248,7 +1315,7 @@ function currentProgForVoice(){
   if(!state.purpose) return [];
   const p=PURPOSES[state.purpose]; if(!p) return [];
   const prog=(p.chords&&p.chords[0])||'';
-  return prog.split(/→|\|/).map(s=>s.trim().split('/')[0].trim()).filter(Boolean);
+  return prog.split(/→|\|/).map(s=>s.trim()).filter(Boolean); // 슬래시 코드 보존
 }
 function setMasking(on){ state.masking=on; document.querySelectorAll("#maskToggle .opt-g").forEach(e=>e.classList.toggle("active", (e.dataset.mk==='on')===on)); render(); }
 function setBinaural(b){ if(b==='off' && binauralActive) stopBinaural(); state.binaural=b; document.querySelectorAll("#binToggle .opt-g").forEach(e=>e.classList.toggle("active", e.dataset.bn===b)); render(); }
@@ -1555,14 +1622,15 @@ function chordToMidiNotes(chord){
 }
 function buildMidi(){
   const PPQ = 480; // ticks per quarter
-  const chords = (lastProgForMidi || '').split(/→|\|/).map(s=>s.trim().split('/')[0].trim()).filter(Boolean);
+  const chords = (lastProgForMidi || '').split(/→|\|/).map(s=>s.trim()).filter(Boolean); // 슬래시 코드 보존
   if(!chords.length) return null;
   const cl = chordLength();
   // 코드 1개 = chordDur 초. 템포는 60BPM 고정(1박=1초)로 잡아 초=박 단순화
   const secPerChord = cl.sec;
   const ticksPerChord = Math.round(secPerChord * PPQ); // 60BPM에서 1초=1박=PPQ
-  function noteEvents(track){
-    // track: array of {note, start(ticks), dur(ticks), vel}
+  function noteEvents(track, ch){
+    // track: array of {note, start(ticks), dur(ticks), vel}. ch: MIDI 채널
+    ch = ch||0;
     let events=[];
     track.forEach(n=>{ events.push({t:n.start, type:'on', note:n.note, vel:n.vel});
                        events.push({t:n.start+n.dur, type:'off', note:n.note, vel:0}); });
@@ -1571,10 +1639,17 @@ function buildMidi(){
     events.forEach(e=>{
       const delta=e.t-last; last=e.t;
       bytes=bytes.concat(writeVarLen(delta));
-      bytes.push(e.type==='on'?0x90:0x80, e.note&0x7F, e.vel&0x7F);
+      bytes.push((e.type==='on'?0x90:0x80)|ch, e.note&0x7F, e.vel&0x7F);
     });
     bytes=bytes.concat(writeVarLen(0)); bytes.push(0xFF,0x2F,0x00); // end of track
     return bytes;
+  }
+  // 채널 초기 설정: 프로그램 체인지(GM 임시 음색) + CC7 볼륨 + CC10 팬 + CC91 리버브 뎁스
+  function chSetup(ch, prog, vol, pan, rev){
+    return [0x00,0xC0|ch, prog&0x7F,
+            0x00,0xB0|ch, 7,  vol&0x7F,
+            0x00,0xB0|ch, 10, pan&0x7F,
+            0x00,0xB0|ch, 91, rev&0x7F];
   }
   // 연주 시간만큼 반복 횟수 계산
   const oneLoopSec = cl.sec * chords.length;
@@ -1582,21 +1657,27 @@ function buildMidi(){
   if(state.midiDur>0){ loops = Math.max(1, Math.ceil((state.midiDur*60)/oneLoopSec)); }
   // 트랙1: 코드 (loops회 반복)
   let chordTrack=[];
+  const voicedAll = voiceProgressionNotes(chords, effectiveRange(), effectiveVoicing()); // top 라인 보이싱
   for(let L=0; L<loops; L++){
     chords.forEach((ch,i)=>{
-      const notes=chordToMidiNotes(ch);
+      const notes=voicedAll[i]||[];
       const startTick = (L*chords.length + i)*ticksPerChord;
-      notes.forEach(nn=> chordTrack.push({note:nn, start:startTick, dur:ticksPerChord-10, vel:64}));
+      // 다이내믹스: 진행에 얕은 아치 (도입 여림 → 3번째 살짝 정점 → 종료 여림)
+      const arc=[58,62,66,56][i%4] + (i===0&&L===0?4:0);
+      notes.forEach(nn=> chordTrack.push({note:nn, start:startTick, dur:ticksPerChord-10, vel:arc}));
     });
   }
   // 트랙: 베이스 (코드 루트음, 한 옥타브 아래) — 별도 트랙
   let bassTrack=[];
   for(let L=0; L<loops; L++){
     chords.forEach((ch,i)=>{
-      const notes=chordToMidiNotes(ch);
+      const notes=voicedAll[i]||[60];
       const startTick = (L*chords.length + i)*ticksPerChord;
-      const root = Math.min(...notes)-12; // 보이싱 최저음의 한 옥타브 아래
-      bassTrack.push({note:root, start:startTick, dur:ticksPerChord-10, vel:60});
+      const bassPc = chordBassSemi(ch); // 슬래시 베이스(전위) 반영
+      const lowN = Math.min(...notes);
+      let bassNote = bassPc + 12*Math.floor((lowN-12)/12);
+      if(bassNote > lowN-3) bassNote -= 12;
+      bassTrack.push({note:bassNote, start:startTick, dur:ticksPerChord-10, vel:54});
     });
   }
   // 트랙: 선율 (멜로디 ON이고 생성돼 있으면)
@@ -1604,13 +1685,25 @@ function buildMidi(){
   if(state.midiMel && randomMelodies.length){
     const mel=randomMelodies[0];
     const keyShift = (state.scaleType==='korea')?0:(NOTE_SEMI[state.key]||0);
-    const noteDur = Math.round(ticksPerChord/2);
-    const totalTicks = loops*chords.length*ticksPerChord;
-    let pos=0, idx=0;
-    while(pos < totalTicks){
-      const s=mel.semis[idx % mel.semis.length];
-      melTrack.push({note:60+keyShift+s, start:pos, dur:noteDur-10, vel:70});
-      pos+=noteDur; idx++;
+    // 시드: 진행+선율 문자열 → 같은 진행·선율이면 항상 같은 프레이즈 (재현성)
+    let ms=(function(str){let h=7;for(let i=0;i<str.length;i++)h=(h*31+str.charCodeAt(i))%2147483647;return h||7;})(String(lastProgForMidi)+mel.semis.join(','));
+    const mr=()=>{ ms=(ms*48271)%2147483647; return ms/2147483647; };
+    let mi=0;
+    for(let L=0; L<loops; L++){
+      chords.forEach((ch,i)=>{
+        const baseTick=(L*chords.length+i)*ticksPerChord;
+        const p = (i===0)?0.72:0.52;              // 쉼표: 코드마다 연주할지 쉴지 (여백)
+        if(mr()>p) return;                         // 이 코드는 침묵
+        const n=1+(mr()<0.5?1:0)+(mr()<0.2?1:0);   // 프레이즈 1~3음
+        const offs=[0.06,0.58,0.82];               // 시작 + 당김 + 꼬리 = 그루브
+        for(let k=0;k<n;k++){
+          const s=mel.semis[mi%mel.semis.length]; mi++;
+          const st=baseTick+Math.round(ticksPerChord*offs[k]);
+          const dur=Math.round(ticksPerChord*(k===0?0.5:0.3));
+          melTrack.push({note:60+keyShift+s, start:st, dur:dur,
+                         vel:k===0?76:58+Math.floor(mr()*10)}); // 첫 음 또렷, 뒤 여리게
+        }
+      });
     }
   }
   // 헤더 (멀티트랙: Format 1)
@@ -1621,20 +1714,35 @@ function buildMidi(){
     const nb=str(name);
     return [0x00,0xFF,0x03, nb.length].concat(nb);
   }
-  // 트랙 구성: [1]템포(콘덕터) [2]코드 [3]베이스 [4]멜로디(있으면)
-  // 각 악기 트랙에 이름 부여 → DAW에서 트랙 분리
-  const inst = (state.aes && LOGIC_INST[state.aes]) ? LOGIC_INST[state.aes] : LOGIC_INST_DEFAULT;
+  // 트랙 구성: [1]콘덕터(4/4·60BPM·마커) [2]코드 ch1 [3]베이스 ch2 [4]멜로디 ch3
+  // Logic에서 "열기(Open)"로 불러오면 템포·마커·트랙명·CC가 그대로 반영됨
   const tracks = [];
-  // 콘덕터 트랙 (템포만)
-  const tempoMeta = [0x00,0xFF,0x51,0x03, 0x0F,0x42,0x40, 0x00,0xFF,0x2F,0x00];
-  tracks.push(tempoMeta);
-  // 코드 트랙
-  tracks.push(trackNameMeta('Chord / Drone').concat(noteEvents(chordTrack)));
-  // 베이스 트랙
-  tracks.push(trackNameMeta('Bass').concat(noteEvents(bassTrack)));
-  // 멜로디 트랙 (있으면)
+  const fxNow = currentFx();
+  const rev = Math.round((fxNow.wet||0.3)*127);
+  // 콘덕터: 트랙명 + 4/4 + 60BPM(1초=1박) + 루프 마커
+  let cond = trackNameMeta('Conductor');
+  cond = cond.concat([0x00,0xFF,0x58,0x04, 4,2,24,8]);       // 4/4
+  cond = cond.concat([0x00,0xFF,0x51,0x03, 0x0F,0x42,0x40]); // 60 BPM
+  const mk0Name = 'SUM WAVE '+(state.purpose||'');
+  const mk0 = mk0Name.split('').map(ch2=>ch2.charCodeAt(0)&0x7F);
+  cond = cond.concat([0x00,0xFF,0x06, mk0.length]).concat(mk0);
+  const ticksPerLoop = chords.length*ticksPerChord;
+  let lastTick=0;
+  for(let L=0; L<loops; L++){
+    const tk=L*ticksPerLoop;
+    const nm=('Loop '+(L+1)).split('').map(ch2=>ch2.charCodeAt(0));
+    cond = cond.concat(writeVarLen(tk-lastTick)).concat([0xFF,0x06,nm.length]).concat(nm);
+    lastTick=tk;
+  }
+  cond = cond.concat(writeVarLen(0),[0xFF,0x2F,0x00]);
+  tracks.push(cond);
+  // 코드 ch1: GM 88 Pad 1 New Age (임시 자리 음색) / 볼륨 84 / 센터 / 리버브 fx.wet
+  tracks.push(trackNameMeta('Chord / Drone').concat(chSetup(0, 88, 84, 64, rev)).concat(noteEvents(chordTrack, 0)));
+  // 베이스 ch2: GM 89 Pad 2 Warm / 볼륨 70 / 센터 / 리버브 절반 (저역은 드라이하게)
+  tracks.push(trackNameMeta('Bass').concat(chSetup(1, 89, 70, 64, Math.round(rev*0.5))).concat(noteEvents(bassTrack, 1)));
+  // 멜로디 ch3: GM 73 Flute (대금 임시) / 볼륨 90 / 살짝 오른쪽 / 리버브 0.85배
   if(melTrack.length){
-    tracks.push(trackNameMeta('Melody').concat(noteEvents(melTrack)));
+    tracks.push(trackNameMeta('Melody').concat(chSetup(2, 73, 90, 72, Math.round(rev*0.85))).concat(noteEvents(melTrack, 2)));
   }
   let file = str('MThd').concat(u32(6), u16(1), u16(tracks.length), u16(PPQ));
   tracks.forEach(t=>{ file = file.concat(str('MTrk'), u32(t.length), t); });
@@ -1645,15 +1753,29 @@ function exportMidi(prog){
   lastProgForMidi = prog;
   const data = buildMidi();
   if(!data){ alert('코드 진행이 없습니다.'); return; }
+  const pn = state.purpose||'sumwave';
+  const fname = `sumwave_${pn}_${state.key}.mid`;
   const blob = new Blob([data], {type:'audio/midi'});
+  // 1) 모바일: Web Share (파일 앱 저장 / AirDrop)
+  let file=null;
+  try{ file=new File([blob], fname, {type:'audio/midi'}); }catch(e){}
+  if(file && navigator.canShare && navigator.canShare({files:[file]})){
+    navigator.share({files:[file], title:fname}).catch(err=>{
+      if(err && err.name!=='AbortError') fallbackMidiDownload(blob, fname);
+    });
+    showFxSettings();
+    return;
+  }
+  // 2) 데스크톱: 다운로드
+  fallbackMidiDownload(blob, fname);
+  showFxSettings();
+}
+function fallbackMidiDownload(blob, fname){
   const url = URL.createObjectURL(blob);
   const a=document.createElement('a');
-  const pn = state.purpose||'sumwave';
-  a.href=url; a.download=`sumwave_${pn}_${state.key}.mid`;
+  a.href=url; a.download=fname;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(()=>URL.revokeObjectURL(url), 1000);
-  // MIDI 추출 시 이펙트 설정도 자동 표시
-  showFxSettings();
+  setTimeout(()=>URL.revokeObjectURL(url), 30000);
 }
 
 
@@ -1729,8 +1851,19 @@ Logic Pro 채널 스트립 · 순서: Channel EQ → Compressor → ChromaVerb
    · Decay: ${fx.rvSec.toFixed(1)} s
    · Mix (Dry/Wet): ${Math.round(fx.wet*100)} %
 
-※ MIDI에는 음표만 담깁니다. 위 이펙트는 Logic에서 직접 입력하세요.
-※ 한 번 입력 후 채널 스트립 프리셋(.cst)으로 저장하면 재사용 가능합니다.
+[MIDI에 이미 박혀 있는 것 — Logic "열기(Open)"로 불러오세요 (Import 아님)]
+   · 템포 60 BPM(1초=1박) · 4/4 · 루프 마커(Loop 1, 2…)
+   · 트랙 분리 + 트랙명 (Chord/Bass/Melody)
+   · 임시 GM 음색(자리 잡기용): 코드 Pad New Age · 베이스 Pad Warm · 멜로디 Flute
+     → Logic 음원으로 바꾸기만 하면 됨 (아래 가상악기 매칭 참고)
+   · 볼륨(CC7): 코드 84 / 베이스 70 / 멜로디 90
+   · 팬(CC10): 코드·베이스 센터 / 멜로디 살짝 오른쪽(72)
+   · 리버브 뎁스(CC91): 위 Mix % 반영 (베이스는 절반 — 저역은 드라이)
+   · 벨로시티 다이내믹스: 코드 아치(여림→정점→여림), 멜로디 첫음 또렷·뒷음 여림
+
+[Logic에서 직접 할 것 — 인서트 플러그인은 MIDI 규격상 파일에 못 담습니다]
+   · 위 ①②③ (EQ·컴프·ChromaVerb)를 채널 스트립에 입력
+   · 한 번 입력 후 채널 스트립 프리셋(.cst)으로 저장 → 다음부턴 클릭 한 번
 
 [편성 비중 — ${aesName}]
 ${inst.note}
